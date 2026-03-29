@@ -1153,6 +1153,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 tensors["entropys"] = outputs["entropys"]
             if "sum_pi_squared" in outputs:
                 tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
+            if (not is_lora) and ("answer_gap" in outputs):
+                tensors["answer_gap"] = outputs["answer_gap"]
             output = DataProto.from_dict(
                 tensors=tensors,
                 meta_info={"temperature": self.config.rollout.temperature},

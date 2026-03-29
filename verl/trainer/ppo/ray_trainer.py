@@ -510,6 +510,30 @@ class RayPPOTrainer:
         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
         return batch_reward
 
+    def _attach_answer_gap_to_extra_info(self, batch: DataProto) -> None:
+        """
+        Attach per-sample answer_gap into non-tensor extra_info for reward functions.
+        """
+        if "answer_gap" not in batch.batch:
+            return
+
+        gaps = batch.batch["answer_gap"].detach().cpu().tolist()
+        extra_info = batch.non_tensor_batch.get("extra_info", None)
+        if extra_info is None:
+            extra_info = [{} for _ in range(len(batch))]
+        else:
+            extra_info = list(extra_info)
+
+        if len(extra_info) < len(gaps):
+            extra_info.extend({} for _ in range(len(gaps) - len(extra_info)))
+
+        for i, gap in enumerate(gaps):
+            item = dict(extra_info[i]) if extra_info[i] is not None else {}
+            item["answer_gap"] = float(gap)
+            extra_info[i] = item
+
+        batch.non_tensor_batch["extra_info"] = np.array(extra_info, dtype=object)
+
     def _should_compute_teacher_colocate(self, batch: DataProto) -> bool:
         return self.use_teacher_policy and not self.distillation_config.teacher_model.enable_resource_pool
 
@@ -1193,18 +1217,20 @@ class RayPPOTrainer:
             entropy = tu.get(output, "entropy")
             log_probs = tu.get(output, "log_probs")
             routed_experts = tu.get(output, "routed_experts")
+            answer_gap = tu.get(output, "answer_gap", default=None)
 
             old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
             # step 4. No padding to padding
             entropy = no_padding_2_padding(entropy, batch_td)
             log_probs = no_padding_2_padding(log_probs, batch_td)
             # step 5: rebuild a tensordict and convert to dataproto
+            old_log_prob_tensors = {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
             if routed_experts is not None:
-                old_log_prob = tu.get_tensordict(
-                    {"old_log_probs": log_probs.float(), "entropys": entropy.float(), "routed_experts": routed_experts}
-                )
-            else:
-                old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float(), "entropys": entropy.float()})
+                old_log_prob_tensors["routed_experts"] = routed_experts
+            if answer_gap is not None:
+                old_log_prob_tensors["answer_gap"] = answer_gap.float()
+
+            old_log_prob = tu.get_tensordict(old_log_prob_tensors)
             old_log_prob = DataProto.from_tensordict(old_log_prob)
         else:
             old_log_prob = self.actor_rollout_wg.compute_log_prob(batch)
@@ -1486,6 +1512,7 @@ class RayPPOTrainer:
 
                                 metrics.update(calculate_debug_metrics(batch))
                     with marked_timer("reward", timing_raw, color="yellow"):
+                        self._attach_answer_gap_to_extra_info(batch)
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
@@ -1493,20 +1520,6 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
-                    import numpy as np
-                    extra_info = batch.non_tensor_batch.get("extra_info", None)
-                    if extra_info is None:
-                        extra_info = [{} for _ in range(len(batch))]
-                    else:
-                        extra_info = list(extra_info)
-
-                    gaps = batch.batch["answer_gap"].detach().cpu().tolist()
-                    for i, gap in enumerate(gaps):
-                        item = dict(extra_info[i]) if extra_info[i] is not None else {}
-                        item["answer_gap"] = float(gap)
-                        extra_info[i] = item
-
-                    batch.non_tensor_batch["extra_info"] = np.array(extra_info, dtype=object)
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
