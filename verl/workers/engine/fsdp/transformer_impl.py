@@ -870,6 +870,98 @@ class EngineTrainModeCtx(BaseEngineCtx):
 
 @EngineRegistry.register(model_type="language_model", backend=["fsdp", "fsdp2"], device=["cuda", "npu"])
 class FSDPEngineWithLMHead(FSDPEngine):
+    answer_open_token_ids: tuple[int, ...] = (27, 9217, 29)
+    answer_yes_token_id: int = 14004
+    answer_no_token_id: int = 5664
+
+    @staticmethod
+    def _find_first_subseq_positions(responses: torch.Tensor, pattern: tuple[int, ...]) -> torch.Tensor:
+        bs, resp_len = responses.shape
+        device = responses.device
+        if not pattern:
+            return torch.full((bs,), -1, device=device, dtype=torch.long)
+        pat = torch.tensor(pattern, device=device, dtype=responses.dtype)
+        m = pat.numel()
+        if resp_len < m:
+            return torch.full((bs,), -1, device=device, dtype=torch.long)
+        windows = responses.unfold(1, m, 1)  # [bs, nwin, m]
+        matched = (windows == pat.view(1, 1, m)).all(-1)  # [bs, nwin]
+        has_match = matched.any(-1)
+        first_idx = matched.long().argmax(-1)
+        return torch.where(has_match, first_idx, torch.full_like(first_idx, -1))
+
+    def _compute_answer_gap_from_flat_pair_logits(
+        self,
+        responses: torch.Tensor,
+        response_lens: torch.Tensor,
+        sequence_offsets: torch.Tensor,
+        pair_logits_flat: torch.Tensor,
+    ) -> torch.Tensor:
+        bs = responses.size(0)
+        answer_gap = torch.full((bs,), float("nan"), device=responses.device, dtype=torch.float32)
+
+        start_pos = self._find_first_subseq_positions(responses, self.answer_open_token_ids)
+        valid = start_pos >= 0
+        if not valid.any():
+            return answer_gap
+
+        valid_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+        yesno_pos = start_pos[valid_idx] + len(self.answer_open_token_ids)
+        in_range = yesno_pos < response_lens[valid_idx]
+        if not in_range.any():
+            return answer_gap
+
+        valid_idx = valid_idx[in_range]
+        yesno_pos = yesno_pos[in_range]
+
+        flat_pos = sequence_offsets[valid_idx] - response_lens[valid_idx] - 1 + yesno_pos
+        in_bounds = (flat_pos >= 0) & (flat_pos < pair_logits_flat.size(0))
+        if not in_bounds.any():
+            return answer_gap
+
+        valid_idx = valid_idx[in_bounds]
+        flat_pos = flat_pos[in_bounds]
+
+        pair_prob = torch.softmax(pair_logits_flat[flat_pos].float(), dim=-1)
+        answer_gap[valid_idx] = pair_prob[:, 0] - pair_prob[:, 1]
+        return answer_gap
+
+    def _compute_answer_gap_from_padded_pair_logits(
+        self,
+        responses: torch.Tensor,
+        response_lens: torch.Tensor,
+        prompt_lens: torch.Tensor,
+        pair_logits_padded: torch.Tensor,
+    ) -> torch.Tensor:
+        bs = responses.size(0)
+        answer_gap = torch.full((bs,), float("nan"), device=responses.device, dtype=torch.float32)
+
+        start_pos = self._find_first_subseq_positions(responses, self.answer_open_token_ids)
+        valid = start_pos >= 0
+        if not valid.any():
+            return answer_gap
+
+        valid_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+        yesno_pos = start_pos[valid_idx] + len(self.answer_open_token_ids)
+        in_range = yesno_pos < response_lens[valid_idx]
+        if not in_range.any():
+            return answer_gap
+
+        valid_idx = valid_idx[in_range]
+        yesno_pos = yesno_pos[in_range]
+
+        token_pos = prompt_lens[valid_idx] + yesno_pos
+        in_bounds = (token_pos >= 0) & (token_pos < pair_logits_padded.size(1))
+        if not in_bounds.any():
+            return answer_gap
+
+        valid_idx = valid_idx[in_bounds]
+        token_pos = token_pos[in_bounds]
+
+        pair_prob = torch.softmax(pair_logits_padded[valid_idx, token_pos].float(), dim=-1)
+        answer_gap[valid_idx] = pair_prob[:, 0] - pair_prob[:, 1]
+        return answer_gap
+
     def prepare_model_inputs(self, micro_batch: TensorDict):
         use_remove_padding = tu.get_non_tensor_data(data=micro_batch, key="use_remove_padding", default=True)
         pad_mode = tu.get_non_tensor_data(data=micro_batch, key="pad_mode", default=DatasetPadMode.NO_PADDING)
@@ -1020,6 +1112,17 @@ class FSDPEngineWithLMHead(FSDPEngine):
         model_output = {}
 
         input_ids = micro_batch["input_ids"]
+        responses = micro_batch.get("responses", None)
+        response_mask = micro_batch.get("response_mask", None)
+        answer_gap = None
+        can_compute_answer_gap = (
+            isinstance(responses, torch.Tensor)
+            and responses.ndim == 2
+            and isinstance(response_mask, torch.Tensor)
+            and response_mask.ndim == 2
+        )
+        if can_compute_answer_gap:
+            answer_gap = torch.full((responses.size(0),), float("nan"), device=responses.device, dtype=torch.float32)
 
         if use_remove_padding:
             input_ids_rmpad_rolled = output_args["input_ids_rmpad_rolled"]
@@ -1032,6 +1135,13 @@ class FSDPEngineWithLMHead(FSDPEngine):
             else:
                 logits_rmpad = output.logits.squeeze(0)  # (total_nnz, vocab_size)
                 logits_rmpad.div_(temperature_rmpad.clamp(min=1e-8).unsqueeze(-1).to(logits_rmpad.dtype))
+                pair_logits_rmpad = torch.stack(
+                    [
+                        logits_rmpad[:, self.answer_yes_token_id],
+                        logits_rmpad[:, self.answer_no_token_id],
+                    ],
+                    dim=-1,
+                )
 
                 # if use_sp: ((total_nnz / sp) + pad) ; if not use_sp: (batch, seqlen)
                 inplace_backward = True
@@ -1082,6 +1192,23 @@ class FSDPEngineWithLMHead(FSDPEngine):
                         unpad_dim=0,
                         padding_size=pad_size,
                     )
+                if not use_fused_kernels:
+                    pair_logits_rmpad = gather_outputs_and_unpad(
+                        pair_logits_rmpad,
+                        gather_dim=0,
+                        unpad_dim=0,
+                        padding_size=pad_size,
+                    )
+
+            if can_compute_answer_gap and (not use_fused_kernels):
+                response_lens = response_mask.sum(dim=-1).to(dtype=torch.long)
+                sequence_offsets = input_ids.offsets()[1:].to(dtype=torch.long)
+                answer_gap = self._compute_answer_gap_from_flat_pair_logits(
+                    responses=responses,
+                    response_lens=response_lens,
+                    sequence_offsets=sequence_offsets,
+                    pair_logits_flat=pair_logits_rmpad,
+                )
 
             if pad_mode == DatasetPadMode.NO_PADDING:
                 cu_seqlens = input_ids.offsets()
@@ -1103,12 +1230,30 @@ class FSDPEngineWithLMHead(FSDPEngine):
                 temperature = output_args["temperature"]  # (bsz,)
                 temperature = temperature.unsqueeze(-1).unsqueeze(-1)
                 logits.div_(temperature.clamp(min=1e-8).to(logits.dtype))
+                pair_logits = torch.stack(
+                    [
+                        logits[:, :, self.answer_yes_token_id],
+                        logits[:, :, self.answer_no_token_id],
+                    ],
+                    dim=-1,
+                )
 
                 if calculate_entropy:
                     if not self.engine_config.entropy_checkpointing:
                         entropy = verl_F.entropy_from_logits(logits)
                     else:
                         entropy = torch.utils.checkpoint.checkpoint(verl_F.entropy_from_logits, logits)
+
+                if can_compute_answer_gap:
+                    response_lens = response_mask.sum(dim=-1).to(dtype=torch.long)
+                    seq_lens = input_ids.offsets().diff().to(dtype=torch.long)
+                    prompt_lens = seq_lens - response_lens
+                    answer_gap = self._compute_answer_gap_from_padded_pair_logits(
+                        responses=responses,
+                        response_lens=response_lens,
+                        prompt_lens=prompt_lens,
+                        pair_logits_padded=pair_logits,
+                    )
 
                 if pad_mode == DatasetPadMode.NO_PADDING:
                     cu_seqlens = input_ids.offsets()
@@ -1130,6 +1275,8 @@ class FSDPEngineWithLMHead(FSDPEngine):
         model_output["log_probs"] = log_probs
         if calculate_entropy:
             model_output["entropy"] = entropy
+        if answer_gap is not None:
+            model_output["answer_gap"] = answer_gap
 
         return model_output
 
