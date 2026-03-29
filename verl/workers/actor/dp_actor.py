@@ -111,7 +111,59 @@ class DataParallelPPOActor(BasePPOActor):
                 "calculate_sum_pi_squared is not supported with "
                 f"{self.use_fused_kernels=} or {self.use_prefix_grouper=} for now."
             )
+        self.answer_open_token_ids = tuple([27, 9217, 29])
+        self.answer_yes_token_id = 14004
+        self.answer_no_token_id = 5664
+    @staticmethod
+    def _find_first_subseq_positions(responses: torch.Tensor, pattern: tuple[int, ...]) -> torch.Tensor:
+        bs, resp_len = responses.shape
+        device = responses.device
+        if not pattern:
+            return torch.full((bs,), -1, device=device, dtype=torch.long)
+        pat = torch.tensor(pattern, device=device, dtype=responses.dtype)
+        m = pat.numel()
+        if resp_len < m:
+            return torch.full((bs,), -1, device=device, dtype=torch.long)
+        windows = responses.unfold(1, m, 1)              # [bs, nwin, m]
+        matched = (windows == pat.view(1, 1, m)).all(-1) # [bs, nwin]
+        has_match = matched.any(-1)
+        first_idx = matched.long().argmax(-1)
+        return torch.where(has_match, first_idx, torch.full_like(first_idx, -1))
+    def _extract_answer_gap(self, responses: torch.Tensor, logits: torch.Tensor) -> dict[str, torch.Tensor]:
+        bs, resp_len, _ = logits.shape
+        device = logits.device
+        dtype = logits.dtype
 
+        answer_gap = torch.full((bs,), float("nan"), device=device, dtype=dtype)
+
+        if (
+            self.answer_open_token_ids is None
+            or self.answer_yes_token_id is None
+            or self.answer_no_token_id is None
+        ):
+            return {"answer_gap": answer_gap}
+
+        log_probs_full = torch.log_softmax(logits, dim=-1)  # [bs, resp_len, vocab]
+        start_pos = self._find_first_subseq_positions(responses, self.answer_open_token_ids)
+        valid = start_pos >= 0
+        if not valid.any():
+            return {"answer_gap": answer_gap}
+
+        valid_idx = torch.nonzero(valid, as_tuple=False).squeeze(-1)
+        yesno_pos = start_pos[valid_idx] + len(self.answer_open_token_ids)
+        in_range = yesno_pos < resp_len
+        if not in_range.any():
+            return {"answer_gap": answer_gap}
+
+        valid_idx = valid_idx[in_range]
+        yesno_pos = yesno_pos[in_range]
+
+        yes_lp = log_probs_full[valid_idx, yesno_pos, self.answer_yes_token_id]
+        no_lp  = log_probs_full[valid_idx, yesno_pos, self.answer_no_token_id]
+
+        pair_prob = torch.softmax(torch.stack([yes_lp, no_lp], dim=-1), dim=-1)
+        answer_gap[valid_idx] = pair_prob[:, 0] - pair_prob[:, 1]
+        return {"answer_gap": answer_gap}
     def _forward_micro_batch(
         self, micro_batch: dict[str, torch.Tensor], temperature: float, calculate_entropy: bool = False
     ) -> dict[str, torch.Tensor]:
@@ -370,6 +422,12 @@ class DataParallelPPOActor(BasePPOActor):
                     logits.div_(temperature)
                     logits = logits[:, -response_length - 1 : -1, :]  # (bsz, response_length, vocab_size)
                     log_probs = logprobs_from_logits(logits, micro_batch["responses"])
+                    answer_stats = None
+                    if self.answer_yes_token_id is not None and self.answer_no_token_id is not None:
+                        answer_stats = self._extract_answer_gap(
+                            responses=micro_batch["responses"],
+                            logits=logits,
+                        )
                     if calculate_entropy:
                         if not self.config.entropy_checkpointing:
                             entropy = verl_F.entropy_from_logits(logits)  # (bsz, response_length)
@@ -382,12 +440,13 @@ class DataParallelPPOActor(BasePPOActor):
                             if not sum_pi_squared_checkpointing
                             else torch.utils.checkpoint.checkpoint(self.calculate_sum_pi_squared_from_logits, logits)
                         )
-
             outputs = {"log_probs": log_probs}
             if calculate_entropy:
                 outputs["entropys"] = entropy
             if calculate_sum_pi_squared:
                 outputs["sum_pi_squared"] = sum_pi_squared
+            if answer_stats is not None:
+                outputs.update(answer_stats) 
             return outputs
 
     def _optimizer_step(self):
@@ -476,6 +535,8 @@ class DataParallelPPOActor(BasePPOActor):
         log_probs_lst = []
         entropy_lst = []
         sum_pi_squared_lst = []
+        answer_gap_lst = []
+        has_answer_gap = False
         for micro_batch in micro_batches:
             micro_batch = micro_batch.to(get_device_id())
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch, "pad_token_id": pad_token_id}
@@ -488,6 +549,9 @@ class DataParallelPPOActor(BasePPOActor):
                 entropy_lst.append(outputs["entropys"])
             if calculate_sum_pi_squared:
                 sum_pi_squared_lst.append(outputs["sum_pi_squared"])
+            if "answer_gap" in outputs:
+                has_answer_gap = True
+                answer_gap_lst.append(outputs["answer_gap"])
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         if calculate_entropy:
@@ -507,6 +571,8 @@ class DataParallelPPOActor(BasePPOActor):
             outputs["entropys"] = entropys
         if calculate_sum_pi_squared:
             outputs["sum_pi_squared"] = sum_pi_squared
+        if has_answer_gap:
+            outputs["answer_gap"] = torch.concat(answer_gap_lst, dim=0)
         return outputs
 
     @GPUMemoryLogger(role="dp actor", logger=logger)

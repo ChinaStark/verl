@@ -1437,14 +1437,7 @@ class RayPPOTrainer:
                             continue
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
-                    with marked_timer("reward", timing_raw, color="yellow"):
-                        # compute reward model score
-                        if self.use_rm and "rm_scores" not in batch.batch.keys():
-                            batch_reward = self._compute_reward_colocate(batch)
-                            batch = batch.union(batch_reward)
-
-                        # extract reward_tensor and reward_extra_infos_dict for training
-                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                    
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1492,7 +1485,28 @@ class RayPPOTrainer:
                                 from verl.utils.debug.metrics import calculate_debug_metrics
 
                                 metrics.update(calculate_debug_metrics(batch))
+                    with marked_timer("reward", timing_raw, color="yellow"):
+                        # compute reward model score
+                        if self.use_rm and "rm_scores" not in batch.batch.keys():
+                            batch_reward = self._compute_reward_colocate(batch)
+                            batch = batch.union(batch_reward)
 
+                        # extract reward_tensor and reward_extra_infos_dict for training
+                        reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                    import numpy as np
+                    extra_info = batch.non_tensor_batch.get("extra_info", None)
+                    if extra_info is None:
+                        extra_info = [{} for _ in range(len(batch))]
+                    else:
+                        extra_info = list(extra_info)
+
+                    gaps = batch.batch["answer_gap"].detach().cpu().tolist()
+                    for i, gap in enumerate(gaps):
+                        item = dict(extra_info[i]) if extra_info[i] is not None else {}
+                        item["answer_gap"] = float(gap)
+                        extra_info[i] = item
+
+                    batch.non_tensor_batch["extra_info"] = np.array(extra_info, dtype=object)
                     assert "old_log_probs" in batch.batch, f'"old_log_prob" not in {batch.batch.keys()=}'
 
                     if self.use_reference_policy:
@@ -1514,7 +1528,15 @@ class RayPPOTrainer:
 
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
-
+                            for k, v in reward_extra_infos_dict.items():
+                                try:
+                                    arr = np.asarray(v, dtype=np.float32)
+                                    if arr.size > 0:
+                                        metrics[f"reward_extra/{k}/mean"] = float(arr.mean())
+                                        metrics[f"reward_extra/{k}/max"] = float(arr.max())
+                                        metrics[f"reward_extra/{k}/min"] = float(arr.min())
+                                except Exception:
+                                    pass
                         # compute rewards. apply_kl_penalty if available
                         if self.config.algorithm.use_kl_in_reward:
                             batch, kl_metrics = apply_kl_penalty(
